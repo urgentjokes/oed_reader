@@ -488,22 +488,26 @@ class OEDEntry:
             self.etymology = strip_tags(etym_match.group(1))
 
         # Structured Senses (cleaning out embedded quotation blocks)
-        senses_found = list(re.finditer(r'<s4(?:\s+num=([^>]+))?>(.*?)</s4>', self.raw_sgml, re.DOTALL))
+        senses_found = list(re.finditer(r'<s4([^>]*)>(.*?)</s4>', self.raw_sgml, re.DOTALL))
         if senses_found:
             for s_match in senses_found:
-                num = (s_match.group(1) or "").strip('"\'')
+                attrs = s_match.group(1)
+                num_m = re.search(r'\bnum=([^\s>]+)', attrs)
+                num = (num_m.group(1).strip('"\'')) if num_m else ""
                 inner = s_match.group(2)
                 # Strip quotation blocks
                 clean = re.sub(r'<qp>.*?</qp>', '', inner, flags=re.DOTALL)
                 clean = re.sub(r'<pqp>.*?</pqp>', '', clean, flags=re.DOTALL)
                 clean = re.sub(r'<q>.*?</q>', '', clean, flags=re.DOTALL)
 
-                s6_list = list(re.finditer(r'<s6(?:\s+num=([^>]+))?>(.*?)</s6>', clean, re.DOTALL))
+                s6_list = list(re.finditer(r'<s6([^>]*)>(.*?)</s6>', clean, re.DOTALL))
                 if s6_list:
                     lead_text = strip_tags(clean[:s6_list[0].start()]).strip()
                     sub_senses = []
                     for s6 in s6_list:
-                        s6_num = (s6.group(1) or "").strip('"\'')
+                        s6_attrs = s6.group(1)
+                        s6_num_m = re.search(r'\bnum=([^\s>]+)', s6_attrs)
+                        s6_num = (s6_num_m.group(1).strip('"\'')) if s6_num_m else ""
                         s6_body = strip_tags(s6.group(2)).strip()
                         if s6_body:
                             sub_senses.append({"num": s6_num, "definition": s6_body})
@@ -524,7 +528,10 @@ class OEDEntry:
                         })
         else:
             # Fallback if no <s4>
-            for s_match in re.finditer(r'<s(\d+)(?:\s+num=([^>]+))?>(.*?)</s\1>', self.raw_sgml, re.DOTALL):
+            for s_match in re.finditer(r'<s(\d+)([^>]*)>(.*?)</s\1>', self.raw_sgml, re.DOTALL):
+                attrs = s_match.group(2)
+                num_m = re.search(r'\bnum=([^\s>]+)', attrs)
+                num = (num_m.group(1).strip('"\'')) if num_m else ""
                 inner = s_match.group(3)
                 clean = re.sub(r'<qp>.*?</qp>', '', inner, flags=re.DOTALL)
                 clean = re.sub(r'<pqp>.*?</pqp>', '', clean, flags=re.DOTALL)
@@ -532,7 +539,7 @@ class OEDEntry:
                 body = strip_tags(clean).strip()
                 if body:
                     self.senses.append({
-                        "num": (s_match.group(2) or "").strip('"\''),
+                        "num": num,
                         "lead": "",
                         "sub_senses": [],
                         "definition": body
