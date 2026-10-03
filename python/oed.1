@@ -20,6 +20,13 @@ oed \- Oxford English Dictionary 2nd Edition (OED2) reader, query engine, and in
 [\fB\-\-limit\fR \fIN\fR|\fB\-n\fR \fIN\fR]
 [\fB\-\-no\-pager\fR]
 .br
+.B oed text
+\fIquery\fR
+[\fB\-\-full\fR]
+[\fB\-\-limit\fR \fIN\fR|\fB\-n\fR \fIN\fR]
+[\fB\-y\fR|\fB\-\-yes\fR]
+[\fB\-\-no\-pager\fR]
+.br
 .B oed search
 \fIprefix\fR
 [\fB\-\-no\-pager\fR]
@@ -116,6 +123,26 @@ Limit the number of displayed results to \fIN\fR words.
 .RE
 
 .TP
+.BR text " " \fIquery\fR " [" \-\-full "] [" \-\-limit " " \fIN\fR | \-n " " \fIN\fR "] [" \-y | \-\-yes "]"
+Search for a substring within the entire text of the dictionary (across all
+7,829 compressed blocks). If more than 50 entries match, warns the user
+and prompts for confirmation before displaying.
+Aliases:
+.BR fulltext ,
+.BR find\-text .
+.RS
+.TP
+.B \-\-full
+Display complete formatted dictionary entries instead of snippet context cards.
+.TP
+.BR \-n " " \fIN\fR ", " \-\-limit " " \fIN\fR
+Limit the number of displayed matching entries to \fIN\fR.
+.TP
+.BR \-y ", " \-\-yes
+Automatically proceed without confirmation prompt if more than 50 entries match.
+.RE
+
+.TP
 .BR search " " \fIprefix\fR
 Search for headwords starting with the specified prefix (e.g.,
 .BR "oed search electr" ).
@@ -168,6 +195,13 @@ Look up the word and include all historical quotations.
 .TP
 .B <word> \-\-raw \fRor\fB :raw <word>
 Look up the word and display raw decompressed SGML markup.
+.TP
+.B :text <query> [--full] [-n N] \fRor\fB text <query>
+Search the entire text of the dictionary for a substring (e.g.
+.BR "OED> :text pin"
+or
+.BR "OED> :text slide rule" ).
+If more than 50 matching entries are found, prompts for confirmation before displaying.
 .TP
 .B :end <suffix> [-s] [-l] [-n N] \fRor\fB end <suffix>
 Search words ending with the given suffix. For example:
@@ -286,6 +320,12 @@ Search single root words ending in "phobia":
 .TP
 Search words ending in "logy", sorted by length:
 .B python3 oed.py end logy --len
+.TP
+Full-text search across all definitions and citations:
+.B python3 oed.py text "slide rule"
+.TP
+Full-text search with match limit:
+.B python3 oed.py text pin -n 50
 .TP
 Pipe raw SGML output into grep:
 .B python3 oed.py lookup algorithm --raw --no-pager | grep '<qd>'

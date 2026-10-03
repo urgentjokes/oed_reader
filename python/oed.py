@@ -951,6 +951,44 @@ class OEDReader:
             return deduped[:max_results]
         return deduped
 
+    def search_text(
+        self,
+        query: str,
+        progress_callback: Optional[Any] = None
+    ) -> List[Tuple[str, str, int]]:
+        """
+        Search for a substring within the entire text of the dictionary across all 7,829 blocks.
+        Returns a list of tuples: (headword_display, entry_sgml, block_idx).
+        """
+        query_clean = query.strip()
+        if not query_clean:
+            return []
+
+        query_lower = query_clean.lower()
+        matches: List[Tuple[str, str, int]] = []
+        entry_re = re.compile(r'<(?:e|ve)(?:\s+[^>]*)?>.*?</(?:e|ve)>', re.DOTALL)
+        hw_re = re.compile(r'<hw>(.*?)</hw>')
+
+        for b in range(self.total_blocks):
+            if progress_callback and b % 250 == 0:
+                progress_callback(b, self.total_blocks)
+
+            text = self.decompress_block(b)
+            if query_lower not in text.lower():
+                continue
+
+            for m in entry_re.finditer(text):
+                eb = m.group(0)
+                if query_lower in eb.lower():
+                    hws = hw_re.findall(eb)
+                    hw_display = ", ".join(strip_tags(h) for h in hws) if hws else "unknown"
+                    matches.append((hw_display, eb, b))
+
+        if progress_callback:
+            progress_callback(self.total_blocks, self.total_blocks)
+
+        return matches
+
 
     def random_entry(self) -> OEDEntry:
         """Return a random entry from the dictionary."""
@@ -1151,6 +1189,141 @@ def cli_end_search(
     paginate(output, enabled=use_pager)
 
 
+def wrap_ansi(text: str, width: int) -> List[str]:
+    """Wrap text to a maximum visible width, preserving ANSI escape codes."""
+    ansi_re = re.compile(r'\033\[[0-9;]*m')
+    words = text.split(' ')
+    lines = []
+    cur_line = []
+    cur_vis_len = 0
+    for w in words:
+        w_vis = len(ansi_re.sub('', w))
+        if cur_vis_len + (1 if cur_line else 0) + w_vis <= width:
+            cur_line.append(w)
+            cur_vis_len += (1 if cur_vis_len > 0 else 0) + w_vis
+        else:
+            if cur_line:
+                lines.append(' '.join(cur_line))
+            cur_line = [w]
+            cur_vis_len = w_vis
+    if cur_line:
+        lines.append(' '.join(cur_line))
+    return lines
+
+
+def extract_snippets(entry_sgml: str, query: str, max_snippets: int = 2, window: int = 45) -> List[str]:
+    """Extract context snippets around occurrences of query within an entry."""
+    clean = strip_tags(entry_sgml)
+    clean_lower = clean.lower()
+    q_lower = query.lower()
+    snippets = []
+    pos = 0
+    while len(snippets) < max_snippets:
+        idx = clean_lower.find(q_lower, pos)
+        if idx == -1:
+            break
+        start = max(0, idx - window)
+        end = min(len(clean), idx + len(query) + window)
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(clean) else ""
+        left = " ".join(clean[start:idx].split())
+        match_str = clean[idx:idx + len(query)]
+        right = " ".join(clean[idx + len(query):end].split())
+        snip = f"{prefix}{left} {BOLD}{YELLOW}{match_str}{RESET} {right}{suffix}"
+        snippets.append(snip.strip())
+        pos = idx + len(query) + 20
+    return snippets
+
+
+def format_text_results(
+    matches: List[Tuple[str, str, int]],
+    query: str,
+    total_found: int,
+    width: Optional[int] = None
+) -> str:
+    """Format full-text search results with snippet cards."""
+    if width is None:
+        term_width = shutil.get_terminal_size((80, 24)).columns
+        width = max(60, min(100, term_width))
+
+    inner_width = width - 4
+    content_width = inner_width - 4
+
+    lines = [""]
+    for hw, eb, b in matches:
+        lines.append(f"• {BOLD}{CYAN}{hw}{RESET}  {DIM}(block {b}){RESET}")
+        snips = extract_snippets(eb, query, max_snippets=2)
+        for s in snips:
+            wrapped = wrap_ansi(f"  {s}", content_width)
+            lines.extend(wrapped)
+        lines.append("")
+
+    title = f"FULL-TEXT SEARCH: \"{query}\" ({total_found:,} matching entr{'ies' if total_found != 1 else 'y'})"
+    if len(matches) < total_found:
+        title += f" [showing first {len(matches)}]"
+
+    return render_box(title, lines, width=width, color_border=CYAN)
+
+
+def cli_text_search(
+    reader: OEDReader,
+    query: str,
+    limit: Optional[int] = None,
+    full: bool = False,
+    confirm_yes: bool = False,
+    use_pager: bool = True
+):
+    query_clean = query.strip()
+    if not query_clean:
+        print("Please provide a text query to search for (e.g. ':text pin').")
+        return
+
+    is_tty = sys.stdout.isatty()
+    def on_progress(cur, total):
+        if is_tty:
+            pct = (cur / total) * 100
+            print(f"\r{CYAN}Searching full text for \"{query_clean}\" across {total:,} blocks... {pct:.0f}%{RESET}", end="", flush=True)
+
+    matches = reader.search_text(query_clean, progress_callback=on_progress if is_tty else None)
+    if is_tty:
+        print("\r\033[K", end="", flush=True)
+
+    total_matches = len(matches)
+    if total_matches == 0:
+        print(f"\nNo entries found containing \"{query_clean}\".\n")
+        return
+
+    # Warning & Confirmation if more than 50 entries
+    display_list = matches
+    if total_matches > 50 and not confirm_yes:
+        print(f"\n{BOLD}{YELLOW}Warning:{RESET} Found {BOLD}{total_matches:,}{RESET} entries containing \"{query_clean}\".")
+        try:
+            resp = input(f"Display all {total_matches:,} entries? [y/N/limit] (or enter number like 50): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            return
+
+        if resp in ("y", "yes"):
+            display_list = matches
+        elif resp.isdigit() and int(resp) > 0:
+            display_list = matches[:int(resp)]
+        elif resp in ("50", "first 50"):
+            display_list = matches[:50]
+        else:
+            print("Cancelled.")
+            return
+    elif limit and limit > 0:
+        display_list = matches[:limit]
+
+    if full:
+        blocks = [OEDEntry(eb).format_terminal() for hw, eb, b in display_list]
+        output = "\n\n" + ("\n" + "—" * 60 + "\n\n").join(blocks)
+    else:
+        output = "\n" + format_text_results(display_list, query_clean, total_found=total_matches)
+
+    paginate(output, enabled=use_pager)
+
+
 def cli_search(reader: OEDReader, prefix: str):
     results = reader.search_prefix(prefix, max_results=50)
     if not results:
@@ -1213,7 +1386,7 @@ def cli_man():
 
 def cli_shell(reader: OEDReader, use_pager: bool = True):
     print(f"{BOLD}Oxford English Dictionary 2nd Edition Interactive Shell{RESET}")
-    print("Commands:  <word> [--all|--raw]  |  :end <suffix>  |  :search <prefix>  |  :man  |  :quit\n")
+    print("Commands:  <word> [--all|--raw]  |  :end <suffix>  |  :text <string>  |  :search <prefix>  |  :man  |  :quit\n")
     while True:
         try:
             line = input(f"{CYAN}OED> {RESET}").strip()
@@ -1228,6 +1401,33 @@ def cli_shell(reader: OEDReader, use_pager: bool = True):
             elif line.startswith((":search ", "search ")):
                 prefix_val = line[8:].strip() if line.startswith(":search ") else line[7:].strip()
                 cli_search(reader, prefix_val)
+            elif line == ":text" or line == "text":
+                print("Usage: :text <query> [--full] [-n|--limit N] (e.g. ':text pin')")
+            elif line.startswith((":text ", "text ")):
+                sub_line = line[6:].strip() if line.startswith(":text ") else line[5:].strip()
+                parts = sub_line.split()
+                full_mode = False
+                limit = None
+                query_tokens = []
+                idx = 0
+                while idx < len(parts):
+                    p = parts[idx]
+                    if p in ("--full", "-f"):
+                        full_mode = True
+                    elif p in ("-n", "--limit") and idx + 1 < len(parts):
+                        try:
+                            limit = int(parts[idx+1])
+                            idx += 1
+                        except ValueError:
+                            pass
+                    else:
+                        query_tokens.append(p)
+                    idx += 1
+                text_query = " ".join(query_tokens).strip()
+                if not text_query:
+                    print("Usage: :text <query> [--full] [-n|--limit N] (e.g. ':text pin')")
+                    continue
+                cli_text_search(reader, text_query, limit=limit, full=full_mode, use_pager=use_pager)
             elif line == ":end" or line == "end" or line == ":suffix" or line == ":ends-with":
                 print("Usage: :end <suffix> [-s|--single] [-n|--limit N] [-l|--len] (e.g. ':end og')")
             elif line.startswith((":end ", ":suffix ", ":ends-with ", "end ")):
@@ -1335,6 +1535,18 @@ def main():
     p_end.add_argument("-n", "--limit", type=int, default=None, help="Limit number of results displayed")
     p_end.add_argument("-l", "--len", action="store_true", help="Sort results by length first")
 
+    # text (full-text search)
+    p_text = subparsers.add_parser(
+        "text",
+        aliases=["fulltext", "find-text"],
+        help="Search for a (sub)string within the entire text of the dictionary",
+        parents=[common_parent]
+    )
+    p_text.add_argument("query", help="Text or substring to search for (e.g. 'pin')")
+    p_text.add_argument("-n", "--limit", type=int, default=None, help="Limit number of results displayed")
+    p_text.add_argument("--full", action="store_true", help="Display full formatted entries instead of snippets")
+    p_text.add_argument("-y", "--yes", action="store_true", help="Proceed without confirmation prompt if > 50 entries")
+
     # random
     subparsers.add_parser("random", help="Display a random dictionary entry", parents=[common_parent])
 
@@ -1377,6 +1589,8 @@ def main():
             cli_search(reader, args.prefix)
         elif args.command in ("end", "suffix", "ends-with"):
             cli_end_search(reader, args.suffix, single_only=args.single, sort_len=args.len, limit=args.limit, use_pager=use_pager)
+        elif args.command in ("text", "fulltext", "find-text"):
+            cli_text_search(reader, args.query, limit=args.limit, full=args.full, confirm_yes=args.yes, use_pager=use_pager)
         elif args.command == "random":
             cli_random(reader, use_pager=use_pager)
         elif args.command == "info":
