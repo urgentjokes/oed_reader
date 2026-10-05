@@ -18,6 +18,7 @@ Features:
 """
 
 import os
+import unicodedata
 import sys
 import glob
 import re
@@ -43,11 +44,17 @@ SGML_ENTITIES = {
     '&dd.': '...', '&mdash.': ' — ', '&ndash.': '–',
     '&es.': ' ', '&sm.': '', '&smm.': '',
     '&oe.': 'œ', '&ae.': 'æ',
-    '&eacu.': 'é', '&egrave.': 'è', '&ecirc.': 'ê', '&euml.': 'ë',
+    '&oelig.': 'œ', '&oelig;': 'œ',
+    '&aelig.': 'æ', '&aelig;': 'æ',
+    '&oe;': 'œ', '&ae;': 'æ',
+    '&eacu.': 'é', '&eacu;': 'é',
+    '&egrave.': 'è', '&egrave;': 'è',
+    '&ecirc.': 'ê', '&euml.': 'ë',
     '&aacu.': 'á', '&agrave.': 'à', '&acirc.': 'â', '&auml.': 'ä',
     '&iacu.': 'í', '&igrave.': 'ì', '&icirc.': 'î', '&iuml.': 'ï',
     '&oacu.': 'ó', '&ograve.': 'ò', '&ocirc.': 'ô', '&ouml.': 'ö',
-    '&uacu.': 'ú', '&ugrave.': 'ù', '&ucirc.': 'û', '&uuml.': 'ü',
+    '&uacu.': 'ú', '&ugrave.': 'ù', '&ucirc.': 'û',
+    '&uuml.': 'ü', '&uuml;': 'ü',
     '&ccedil.': 'ç', '&ntilde.': 'ñ', '&th.': 'þ', '&dh.': 'ð',
     '&c.': '&c.', '&amp.': '&', '&ast.': '*',
     '&prime.': '′', '&sec.': '″',
@@ -82,10 +89,18 @@ def strip_tags(text: str) -> str:
 
 def normalize_headword(text: str) -> str:
     """Normalize a headword for alphabetical comparison (lowercase, strip tags/entities/punctuation)."""
-    clean = re.sub(r'<[^>]+>', '', text)
-    clean = re.sub(r'&[a-zA-Z0-9]+[.;]', '', clean)
-    clean = re.sub(r'[^a-zA-Z0-9]', '', clean).lower()
-    return re.sub(r'\d+$', '', clean)
+    decoded = decode_entities(text)
+    trans = (decoded
+             .replace('æ', 'ae')
+             .replace('œ', 'oe')
+             .replace('þ', 'th')
+             .replace('ð', 'dh'))
+    without_tags = re.sub(r'<[^>]+>', '', trans)
+    without_lingering = re.sub(r'&[a-zA-Z0-9]+[.;]', '', without_tags)
+    nfkd = unicodedata.normalize('NFKD', without_lingering)
+    ascii_t = ''.join(c for c in nfkd if not unicodedata.combining(c))
+    ascii_clean = re.sub(r'[^a-zA-Z0-9]', '', ascii_t).lower()
+    return re.sub(r'\d+$', '', ascii_clean)
 
 
 def find_oed_dat_path(explicit_path: Optional[str] = None) -> str:
@@ -477,6 +492,13 @@ class OEDEntry:
                     self.part_of_speech = strip_tags(ps_match.group(1))
 
         # Variant forms
+        if hg_match:
+            hg_hws = [strip_tags(h) for h in re.findall(r'<hw>(.*?)</hw>', hg_match.group(1))]
+            if len(hg_hws) > 1:
+                for alt_hw in hg_hws[1:]:
+                    if alt_hw and alt_hw not in self.variant_forms:
+                        self.variant_forms.append(alt_hw)
+
         for vf_match in re.finditer(r'<vfl>(.*?)</vfl>', self.raw_sgml, re.DOTALL):
             vf_clean = strip_tags(vf_match.group(1))
             if vf_clean and vf_clean not in self.variant_forms:
@@ -770,6 +792,52 @@ class OEDReader:
         raw_hws = re.findall(r'<hw>(.*?)</hw>', text)
         return [strip_tags(h) for h in raw_hws if strip_tags(h)]
 
+    def _find_blocks_in_index(self, norm_target: str) -> List[int]:
+        paths = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "headwords.tsv"),
+            os.path.expanduser("~/.cache/oed/headwords.tsv"),
+        ]
+        tsv_path = None
+        for p in paths:
+            if os.path.isfile(p):
+                tsv_path = p
+                break
+        if not tsv_path:
+            return []
+
+        target = norm_target.encode("utf-8")
+        try:
+            with open(tsv_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                file_size = f.tell()
+                low, high = 0, file_size
+                while low <= high:
+                    mid = (low + high) // 2
+                    f.seek(mid)
+                    if mid != 0:
+                        f.readline()
+                    line = f.readline()
+                    if not line:
+                        high = mid - 1
+                        continue
+                    parts = line.rstrip(b"\r\n").split(b"\t")
+                    if not parts or not parts[0]:
+                        high = mid - 1
+                        continue
+                    norm = parts[0]
+                    if norm == target:
+                        if len(parts) >= 3:
+                            blocks_str = parts[2].decode("utf-8", errors="ignore")
+                            return [int(x) for x in blocks_str.split(",") if x.isdigit()]
+                        return []
+                    elif norm < target:
+                        low = f.tell()
+                    else:
+                        high = mid - 1
+        except Exception:
+            pass
+        return []
+
     def lookup(self, word: str) -> List[OEDEntry]:
         """
         Fast binary search for a headword across the 7,829 compressed blocks.
@@ -779,8 +847,28 @@ class OEDReader:
         if not norm_target:
             return []
 
+        # 1. Fast indexed lookup if headwords.tsv is available (<1ms)
+        candidate_blocks = self._find_blocks_in_index(norm_target)
+        if candidate_blocks:
+            matches = []
+            for b in candidate_blocks:
+                start_blk = max(0, b - 1)
+                end_blk = min(self.total_blocks, b + 2)
+                combined_text = "".join(self.decompress_block(blk) for blk in range(start_blk, end_blk))
+                for m in re.finditer(r'<(?:e|ve)(?:\s+[^>]*)?>(.*?)</(?:e|ve)>', combined_text, re.DOTALL):
+                    entry_body = m.group(0)
+                    hws = re.findall(r'<hw>(.*?)</hw>', entry_body)
+                    for hw in hws:
+                        if normalize_headword(hw) == norm_target:
+                            matches.append(OEDEntry(entry_body))
+                            break
+            if matches:
+                return matches
+
+        # 2. Fallback: Binary search over alphabetically ordered blocks
         low, high = 0, self.total_blocks - 1
         target_block = -1
+        best_block = -1
 
         # Binary search over alphabetically ordered blocks
         while low <= high:
@@ -802,21 +890,22 @@ class OEDReader:
             if not hws:
                 break
 
-            first_hw, last_hw = hws[0], hws[-1]
-            if first_hw <= norm_target <= last_hw or norm_target in hws:
+            first_hw = hws[0]
+            if norm_target in hws:
                 target_block = mid
                 break
             elif norm_target < first_hw:
                 high = mid - 1
             else:
+                best_block = mid
                 low = mid + 1
 
         if target_block == -1:
-            target_block = max(0, min(self.total_blocks - 1, high))
+            target_block = max(0, best_block)
 
         # Check target_block and adjacent blocks to handle boundaries
-        start_blk = max(0, target_block - 1)
-        end_blk = min(self.total_blocks, target_block + 3)
+        start_blk = max(0, target_block - 2)
+        end_blk = min(self.total_blocks, target_block + 4)
         combined_text = "".join(self.decompress_block(b) for b in range(start_blk, end_blk))
 
         matches = []
@@ -833,26 +922,43 @@ class OEDReader:
     def search_prefix(self, prefix: str, max_results: int = 20) -> List[str]:
         """Search for headwords matching a given prefix."""
         norm_prefix = normalize_headword(prefix)
+        if not norm_prefix:
+            return []
+
         # Find starting block via binary search
         low, high = 0, self.total_blocks - 1
-        start_block = 0
+        best_block = 0
         while low <= high:
             mid = (low + high) // 2
             text = self.decompress_block(mid)
             raw_hws = re.findall(r'<hw>(.*?)</hw>', text)
             hws = [normalize_headword(h) for h in raw_hws if normalize_headword(h)]
             if not hws:
-                high = mid - 1
-                continue
-            if hws[-1] < norm_prefix:
-                low = mid + 1
-            else:
-                start_block = mid
-                high = mid - 1
+                prev = mid - 1
+                while prev >= 0 and not hws:
+                    p_text = self.decompress_block(prev)
+                    p_hws = [normalize_headword(h) for h in re.findall(r'<hw>(.*?)</hw>', p_text) if normalize_headword(h)]
+                    if p_hws:
+                        hws = [p_hws[-1]]
+                    prev -= 1
 
+            if not hws:
+                break
+
+            first_hw = hws[0]
+            if any(h.startswith(norm_prefix) for h in hws):
+                best_block = mid
+                high = mid - 1
+            elif norm_prefix < first_hw:
+                high = mid - 1
+            else:
+                best_block = mid
+                low = mid + 1
+
+        start_block = max(0, best_block - 1)
         results = []
         seen = set()
-        for b in range(start_block, min(self.total_blocks, start_block + 15)):
+        for b in range(start_block, min(self.total_blocks, start_block + 20)):
             hws = self.get_block_headwords(b)
             for h in hws:
                 norm_h = normalize_headword(h)
@@ -879,8 +985,8 @@ class OEDReader:
                 entries = []
                 with open(cache_file, "r", encoding="utf-8") as f:
                     for line in f:
-                        parts = line.rstrip("\n").split("\t", 1)
-                        if len(parts) == 2:
+                        parts = line.rstrip("\n").split("\t")
+                        if len(parts) >= 2:
                             entries.append((parts[0], parts[1]))
                 if entries:
                     return entries
